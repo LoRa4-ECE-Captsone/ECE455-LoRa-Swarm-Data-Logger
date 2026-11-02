@@ -8,6 +8,7 @@
 import argparse
 import faulthandler
 import json
+import os
 import signal
 import sqlite3
 import sys
@@ -15,6 +16,8 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from dotenv import load_dotenv
+from supabase import create_client
 
 DB_FILE = Path(__file__).resolve().parent / "sensor_data.db"
 
@@ -60,6 +63,55 @@ MEASUREMENT_EXTRA_COLUMNS = {
 }
 
 db_lock = threading.Lock()
+
+# Supabase cloud connection
+supabase_client = None
+
+
+def initialize_supabase():
+    global supabase_client
+
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+
+    url = os.getenv("SUPABASE_URL")
+    key = os.getenv("SUPABASE_SECRET_KEY")
+
+    if not url or not key:
+        print("Supabase not configured. Using local SQLite only.")
+        return
+
+    try:
+        supabase_client = create_client(url, key)
+        print("Supabase cloud client initialized.")
+    except Exception as e:
+        print(f"Supabase initialization failed: {e}")
+
+
+def upload_to_supabase(row):
+    if supabase_client is None:
+        return
+
+    # Only include fields that exist in the cloud table.
+    cloud_row = {
+        "timestamp": datetime.strptime(
+            row["timestamp"], "%Y-%m-%d %H:%M:%S"
+        ).astimezone().isoformat(),
+        "node_id": str(row["node_id"]),
+        "water_temp": row.get("water_temp"),
+        "ph": row.get("ph"),
+        "conductivity": row.get("conductivity"),
+        "dissolved_oxygen": row.get("dissolved_oxygen"),
+        "turbidity": row.get("turbidity"),
+        "latitude": row.get("latitude"),
+        "longitude": row.get("longitude"),
+        "simulated": bool(row.get("simulated")),
+    }
+
+    try:
+        supabase_client.table("measurements").insert(cloud_row).execute()
+        print(f"Cloud upload successful: node {row['node_id']}")
+    except Exception as e:
+        print(f"Cloud upload failed (local data preserved): {e}")
 
 
 def add_missing_columns(conn, table, columns):
@@ -285,7 +337,7 @@ def store_measurement(conn, data, packet=None, gateway_id=None):
         label = "SIMULATED " if row["simulated"] else ""
         signal = f" rssi={row.get('rx_rssi')} snr={row.get('rx_snr')} hops={row.get('hops')}" if packet else ""
         print(f"[{row['timestamp']}] {label}{node_hex(node_id)} seq {row['seq']}{signal}: {data}")
-
+        upload_to_supabase(row)
 
 def store_node_status(conn, packet, gateway_id):
     decoded = packet.get("decoded", {})
@@ -457,6 +509,7 @@ def main():
     faulthandler.enable()
 
     conn = open_db()
+    initialize_supabase()
     print(f"Writing to {DB_FILE}")
     try:
         if args.stdin:

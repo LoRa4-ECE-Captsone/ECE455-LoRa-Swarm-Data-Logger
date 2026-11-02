@@ -2,9 +2,12 @@
 import html
 import math
 import sqlite3
+import os
 from datetime import datetime, timedelta
 from io import BytesIO
 from pathlib import Path
+from dotenv import load_dotenv
+from supabase import create_client
 
 import altair as alt
 import numpy as np
@@ -90,18 +93,77 @@ def node_hex(node_id):
     return f"!{int(node_id):08x}"
 
 
+
 def load_table(name):
-    if not DB_FILE.exists():
-        return pd.DataFrame()
-    with sqlite3.connect(DB_FILE) as conn:
-        exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone()
-        if not exists:
+    df = pd.DataFrame()
+
+    # Load water-quality measurements from Supabase.
+    if name == "measurements":
+        try:
+            load_dotenv(Path(__file__).resolve().parent / ".env")
+
+            url = os.getenv("SUPABASE_URL")
+            key = os.getenv("SUPABASE_KEY")
+
+            if url and key:
+                supabase = create_client(url, key)
+
+                response = (
+                    supabase.table("measurements")
+                    .select("*")
+                    .order("timestamp", desc=True)
+                    .limit(1000)
+                    .execute()
+                )
+
+                df = pd.DataFrame(response.data)
+
+                # Match the data types expected by the existing dashboard.
+                if not df.empty:
+                    df["node_id"] = pd.to_numeric(
+                        df["node_id"], errors="coerce"
+                )
+                df = df.dropna(subset=["node_id"]).copy()
+                df["node_id"] = df["node_id"].astype(int)
+                df["simulated"] = df["simulated"].fillna(False).astype(int)
+        
+
+        except Exception as e:
+            print(f"Supabase read failed: {e}")
+            df = pd.DataFrame()
+
+    # Continue using SQLite for other tables and as a fallback.
+    if df.empty:
+        if not DB_FILE.exists():
             return pd.DataFrame()
-        df = pd.read_sql_query(f"SELECT * FROM {name}", conn)
+
+        with sqlite3.connect(DB_FILE) as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (name,)
+            ).fetchone()
+
+            if not exists:
+                return pd.DataFrame()
+
+            df = pd.read_sql_query(f"SELECT * FROM {name}", conn)
+
+    
     if "timestamp" in df.columns:
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
-        df = df.sort_values(["timestamp", "id"] if "id" in df.columns else "timestamp", ignore_index=True)
+        df["timestamp"] = (
+            pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+            .dt.tz_convert("America/Chicago")
+            .dt.tz_localize(None)
+        )
+
+        df = df.sort_values(
+            ["timestamp", "id"] if "id" in df.columns else "timestamp",
+            ignore_index=True
+        )
+
+
     return df
+
 
 
 def with_columns(df, columns):

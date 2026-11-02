@@ -2,3 +2,8 @@ streamlit>=1.50
 pandas
 openpyxl
 meshtastic>=2.5
+supabase
+python-dotenv
+numpy
+pydeck
+altair
