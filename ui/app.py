@@ -98,7 +98,7 @@ def load_table(name):
     df = pd.DataFrame()
 
     # Load water-quality measurements from Supabase.
-    if name == "measurements":
+    if name in ("measurements", "weather"):
         try:
             load_dotenv(Path(__file__).resolve().parent / ".env")
 
@@ -109,7 +109,7 @@ def load_table(name):
                 supabase = create_client(url, key)
 
                 response = (
-                    supabase.table("measurements")
+                    supabase.table(name)
                     .select("*")
                     .order("timestamp", desc=True)
                     .limit(1000)

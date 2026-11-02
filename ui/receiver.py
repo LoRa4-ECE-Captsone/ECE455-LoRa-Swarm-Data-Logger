@@ -114,6 +114,31 @@ def upload_to_supabase(row):
         print(f"Cloud upload failed (local data preserved): {e}")
 
 
+def upload_weather_to_supabase(row):
+    if supabase_client is None:
+        return
+
+    cloud_row = row.copy()
+
+    # Convert SQLite's integer flag to a PostgreSQL boolean.
+    cloud_row["simulated"] = bool(row.get("simulated"))
+
+    # Convert local timestamps to timezone-aware values.
+    for field in ("timestamp", "received_at"):
+        if cloud_row.get(field):
+            cloud_row[field] = (
+                datetime.strptime(
+                    cloud_row[field], "%Y-%m-%d %H:%M:%S"
+                ).astimezone().isoformat()
+            )
+
+    try:
+        supabase_client.table("weather").insert(cloud_row).execute()
+        print(f"Weather cloud upload successful: node {row['node_id']}")
+    except Exception as e:
+        print(f"Weather cloud upload failed (local data preserved): {e}")
+
+
 def add_missing_columns(conn, table, columns):
     existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
     for column, sql_type in columns.items():
@@ -313,8 +338,11 @@ def store_weather(conn, data, packet=None, gateway_id=None):
         "longitude": as_float(data.get("lon")),
         **link_fields(packet, gateway_id),
     }
+    
     if insert_row(conn, "weather", row):
         print(f"[{row['timestamp']}] {node_hex(node_id)} weather seq {row['seq']}: {data}")
+        upload_weather_to_supabase(row)
+
 
 
 def store_measurement(conn, data, packet=None, gateway_id=None):
@@ -522,3 +550,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+ 
