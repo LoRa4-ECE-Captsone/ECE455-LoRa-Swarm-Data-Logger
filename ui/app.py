@@ -314,7 +314,7 @@ def show_heatmap(source, status, names, column, label, unit, decimals, height=40
 
     positions["color"] = [ramp_color(scale(v)) + [255] if pd.notna(v) else [128, 128, 128, 255] for v in positions["value"]]
     layers, side = [], 300.0
-    if not valued.empty:
+    if len(valued) >= 3:
         grid, step, side = idw_grid(
             valued["latitude"].to_numpy(float), valued["longitude"].to_numpy(float), valued["value"].to_numpy(float)
         )
@@ -337,7 +337,15 @@ def show_heatmap(source, status, names, column, label, unit, decimals, height=40
     zoom = math.log2(156_543 * math.cos(math.radians(lat0)) * 700 / max(side, 50.0))
     view = pdk.ViewState(latitude=lat0, longitude=positions["longitude"].mean(), zoom=min(max(zoom, 3), 19))
     tooltip = {"html": "<b>{name}</b> ({node_hex})<br/>" + html.escape(label) + ": {value_text}<br/>{signal}"}
-    st.pydeck_chart(pdk.Deck(layers=layers, initial_view_state=view, tooltip=tooltip, map_style=None), height=height)
+    st.pydeck_chart(
+    pdk.Deck(
+        layers=layers,
+        initial_view_state=view,
+        tooltip=tooltip,
+        map_style="https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json",
+    ),
+    height=height,
+    )
     if not valued.empty:
         st.caption(
             f"{label}: blue = {fmt(low, unit, decimals)}, red = {fmt(high, unit, decimals)} across {len(valued)} node(s). "
