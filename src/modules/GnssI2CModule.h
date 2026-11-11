@@ -27,11 +27,25 @@ class GnssI2CModule : private concurrency::OSThread
     bool fixValid = false;
     bool publishedOnce = false;
     bool clockSetOnce = false;
+    bool disabledLogged = false;
     uint8_t busErrors = 0;
     uint32_t lastPublishMs = 0;
     uint32_t lastClockSetMs = 0;
+    uint32_t lastSearchLogMs = 0;
+
+    // UBX-CFG acknowledgement tracking, fed from the byte stream in drain().
+    uint64_t ubxWindow = 0;
+    uint8_t ubxAcks = 0;
+    uint8_t ubxNaks = 0;
+    uint8_t configTries = 0;
+    bool configPending = false;
+    uint32_t configSentMs = 0;
 
     bool probe();
+    bool sendUbx(uint8_t cls, uint8_t id, const uint8_t *payload, uint16_t len);
+    void configure();
+    void checkConfigured();
+    void enableInNodeConfig();
     int32_t bytesAvailable();
     bool drain();
     bool hasFreshLock();

@@ -92,10 +92,20 @@ def main():
 
         # Relays otherwise only transmit every 30 min, which makes "is it on?" unknowable on the dashboard.
         telemetry = node.moduleConfig.telemetry
+        changed = []
         if telemetry.device_update_interval == 0 or telemetry.device_update_interval > 300:
             telemetry.device_update_interval = 300
+            changed.append("device status every 5 min (so the dashboard can tell when this node is on)")
+        # Reports the RAK1906 BME680 (air temp/humidity/pressure); nodes without an I2C sensor just skip it.
+        if not telemetry.environment_measurement_enabled:
+            telemetry.environment_measurement_enabled = True
+            changed.append("environment telemetry on")
+        if telemetry.environment_update_interval == 0 or telemetry.environment_update_interval > 300:
+            telemetry.environment_update_interval = 300
+            changed.append("environment readings every 5 min")
+        if changed:
             node.writeConfig("telemetry")
-            print("Device telemetry set to every 5 min so the dashboard can tell when this node is on.")
+            print("Telemetry: " + "; ".join(changed) + ".")
 
         lora = node.localConfig.lora
         if lora.region == config_pb2.Config.LoRaConfig.RegionCode.UNSET:

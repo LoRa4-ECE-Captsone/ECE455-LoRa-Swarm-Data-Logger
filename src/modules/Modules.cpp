@@ -106,6 +106,9 @@
 #ifdef HAS_SONDE
 #include "modules/SondeModule.h"
 #endif
+#ifdef HAS_TEMP_STRING
+#include "modules/TempStringModule.h"
+#endif
 
 #if defined(HAS_HARDWARE_WATCHDOG)
 #include "watchdog/watchdogThread.h"
@@ -140,6 +143,9 @@ void setupModules()
 #endif
 #ifdef HAS_SONDE
     sondeModule = new SondeModule();
+#endif
+#ifdef HAS_TEMP_STRING
+    tempStringModule = new TempStringModule();
 #endif
 #if !MESHTASTIC_EXCLUDE_WAYPOINT
     waypointModule = new WaypointModule();

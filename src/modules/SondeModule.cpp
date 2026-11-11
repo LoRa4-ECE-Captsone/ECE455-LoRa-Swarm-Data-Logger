@@ -5,19 +5,16 @@
 #include "MeshService.h"
 #include "NodeDB.h"
 #include "RTC.h"
+#include "SwarmReport.h"
 #include "Throttle.h"
-#include <algorithm>
 #include <math.h>
 #include <string.h>
 
+using swarm::JsonWriter;
+using swarm::usable;
+
 SondeModule *sondeModule;
 
-#ifndef SONDE_INTERVAL_SECS
-#define SONDE_INTERVAL_SECS (30 * 60)
-#endif
-#ifndef SONDE_SIMULATE
-#define SONDE_SIMULATE 0
-#endif
 #ifndef SONDE_BRUSH
 #define SONDE_BRUSH 1
 #endif
@@ -81,104 +78,6 @@ static uint16_t modbusCrc(const uint8_t *data, size_t len)
     return crc;
 }
 
-// The Y4000 reports -9999 (or garbage) for probes that are not fitted.
-static bool usable(float v)
-{
-    return isfinite(v) && v > -9000.0f && fabsf(v) < 1.0e6f;
-}
-
-namespace
-{
-struct JsonWriter {
-    char *buf;
-    size_t cap;
-    size_t len = 0;
-    bool ok = true;
-
-    JsonWriter(char *b, size_t c) : buf(b), cap(c) { raw("{"); }
-
-    void raw(const char *s)
-    {
-        size_t n = strlen(s);
-        if (!ok || len + n + 1 > cap) {
-            ok = false;
-            return;
-        }
-        memcpy(buf + len, s, n);
-        len += n;
-        buf[len] = '\0';
-    }
-
-    void key(const char *k)
-    {
-        raw(len > 1 ? ",\"" : "\"");
-        raw(k);
-        raw("\":");
-    }
-
-    void integer(const char *k, uint32_t v)
-    {
-        char tmp[12];
-        snprintf(tmp, sizeof(tmp), "%lu", (unsigned long)v);
-        key(k);
-        raw(tmp);
-    }
-
-    void str(const char *k, const char *v)
-    {
-        key(k);
-        raw("\"");
-        raw(v);
-        raw("\"");
-    }
-
-    // Integer-only fixed-point formatting so the output doesn't depend on newlib float printf support.
-    void fixed(const char *k, int32_t scaled, uint8_t decimals)
-    {
-        char tmp[16];
-        char *p = tmp + sizeof(tmp);
-        *--p = '\0';
-        uint32_t mag = scaled < 0 ? (uint32_t)(-(int64_t)scaled) : (uint32_t)scaled;
-        for (uint8_t i = 0; i < decimals; i++) {
-            *--p = '0' + mag % 10;
-            mag /= 10;
-        }
-        if (decimals)
-            *--p = '.';
-        do {
-            *--p = '0' + mag % 10;
-            mag /= 10;
-        } while (mag);
-        if (scaled < 0)
-            *--p = '-';
-        key(k);
-        raw(p);
-    }
-
-    void number(const char *k, float v, uint8_t decimals)
-    {
-        if (!usable(v))
-            return;
-        static const float scale[] = {1.0f, 10.0f, 100.0f, 1000.0f};
-        fixed(k, (int32_t)lroundf(v * scale[decimals]), decimals);
-    }
-
-    size_t finish()
-    {
-        raw("}");
-        return ok ? len : 0;
-    }
-};
-
-void addPosition(JsonWriter &j)
-{
-    if (localPosition.latitude_i != 0 || localPosition.longitude_i != 0) {
-        j.fixed("lat", localPosition.latitude_i / 10, 6);
-        j.fixed("lon", localPosition.longitude_i / 10, 6);
-    }
-}
-} // namespace
-
 SondeModule::SondeModule() : SinglePortModule("sonde", meshtastic_PortNum_PRIVATE_APP), concurrency::OSThread("Sonde") {}
 
 void SondeModule::powerSonde(bool on)
@@ -202,12 +101,11 @@ void SondeModule::sendFrame(uint8_t *frame, size_t lenWithoutCrc)
 
     while (RS485_SERIAL.available())
         RS485_SERIAL.read();
-    RS485_SERIAL.write(frame, lenWithoutCrc + 2);
+    txLen = lenWithoutCrc + 2;
+    memcpy(txFrame, frame, txLen);
+    echoPending = true;
+    RS485_SERIAL.write(frame, txLen);
     RS485_SERIAL.flush();
-    // Discard any transceiver echo; a Modbus slave must stay silent for 3.5 chars (~4 ms) before replying.
-    delay(2);
-    while (RS485_SERIAL.available())
-        RS485_SERIAL.read();
 
     rxLen = 0;
     requestSentMs = millis();
@@ -229,6 +127,21 @@ SondeModule::Reply SondeModule::pollReply(uint8_t addr, size_t expectedLen)
 {
     while (RS485_SERIAL.available() && rxLen < sizeof(rx))
         rx[rxLen++] = RS485_SERIAL.read();
+
+    // If the transceiver echoes our own request, drop exactly that echo. Byte 2 always differs between a read
+    // request (start address high byte) and its reply (byte count), so a real reply is never mistaken for one.
+    if (echoPending) {
+        size_t n = std::min(rxLen, txLen);
+        if (memcmp(rx, txFrame, n) != 0) {
+            echoPending = false;
+        } else if (rxLen >= txLen) {
+            memmove(rx, rx + txLen, rxLen - txLen);
+            rxLen -= txLen;
+            echoPending = false;
+        } else if (Throttle::isWithinTimespanMs(requestSentMs, REPLY_TIMEOUT_MS)) {
+            return Reply::Pending;
+        }
+    }
 
     // Resync on the slave address in case the transceiver produced noise at power-up.
     size_t skip = 0;
@@ -272,9 +185,11 @@ void SondeModule::decodeWeather()
     const uint16_t raw = (uint16_t)((rx[3] << 8) | rx[4]);
     LOG_DEBUG("RS485: weather reg 0x%04x = 0x%04x (%u)", WX_REGS[weatherPart], raw, raw);
     // Physically impossible values are dropped (left NaN) so a stray "not ready" word never reaches the mesh.
-    auto keep = [](float &field, float value, float low, float high) {
-        if (value >= low && value <= high)
+    auto keep = [this](float &field, float value, float low, float high) {
+        if (value >= low && value <= high) {
             field = value;
+            weatherValid++;
+        }
     };
     switch (weatherPart) {
     case 0:
@@ -358,7 +273,7 @@ size_t SondeModule::buildJson(char *buf, size_t cap, bool compact)
         j.str("err", "no_reply");
     }
 
-    addPosition(j);
+    swarm::addPosition(j);
     return j.finish();
 }
 
@@ -380,7 +295,7 @@ size_t SondeModule::buildWeatherJson(char *buf, size_t cap)
     j.number("pressure", weather.pressureHpa, 0);
     j.number("lux", weather.lux, 0);
     j.number("rain", weather.rainMm, 1);
-    addPosition(j);
+    swarm::addPosition(j);
     return j.finish();
 }
 
@@ -428,21 +343,7 @@ void SondeModule::sendReport()
 
 int32_t SondeModule::msUntilNextCycle()
 {
-    const uint64_t intervalMs = (uint64_t)SONDE_INTERVAL_SECS * 1000;
-    uint32_t now = getValidTime(RTCQualityDevice);
-    if (now == 0)
-        return (int32_t)intervalMs;
-
-    // Align to wall-clock boundaries (e.g. :00 and :30) so the swarm samples together, offset per node by a fixed
-    // hash of its ID so nodes on the same boundary don't all transmit at once.
-    const uint64_t spreadMs = std::min<uint64_t>(intervalMs / 2, 60 * 1000);
-    const uint64_t offsetMs = spreadMs ? ((uint64_t)nodeDB->getNodeNum() * 2654435761u) % spreadMs : 0;
-    const uint64_t nowMs = (uint64_t)now * 1000;
-    uint64_t target = ((nowMs + intervalMs - offsetMs) / intervalMs) * intervalMs + offsetMs;
-    // `now` only has 1 s resolution, so make sure we never re-fire the slot we just ran.
-    if (target < nowMs + 2000)
-        target += intervalMs;
-    return (int32_t)(target - nowMs);
+    return swarm::msUntilNextSlot();
 }
 
 int32_t SondeModule::runOnce()
@@ -453,8 +354,8 @@ int32_t SondeModule::runOnce()
         pinMode(SONDE_POWER_PIN, OUTPUT);
         digitalWrite(SONDE_POWER_PIN, LOW);
 #endif
-        LOG_INFO("RS485: Y4000 sonde at Modbus addr %u, SEN0657 weather station at addr %u (0 = none), every %us%s",
-                 SONDE_MODBUS_ADDR, WX_MODBUS_ADDR, SONDE_INTERVAL_SECS, SONDE_SIMULATE ? " (SIMULATED)" : "");
+        LOG_INFO("RS485: %u baud 8N1; Y4000 sonde at Modbus addr %u, SEN0657 weather station at addr %u (0 = none), every %us%s",
+                 RS485_BAUD, SONDE_MODBUS_ADDR, WX_MODBUS_ADDR, SONDE_INTERVAL_SECS, SONDE_SIMULATE ? " (SIMULATED)" : "");
         step = Step::Idle;
         return FIRST_CYCLE_DELAY_MS;
 
@@ -463,6 +364,7 @@ int32_t SondeModule::runOnce()
         statusOk = false;
         weatherOk = false;
         weatherPart = 0;
+        weatherValid = 0;
         luxHighOk = false;
         weather = {NAN, NAN, NAN, NAN, NAN, NAN, NAN};
         attempts = 0;
@@ -546,6 +448,8 @@ int32_t SondeModule::runOnce()
         attempts = 0;
         // A part that never answered leaves its fields NaN, which the JSON writer omits.
         step = ++weatherPart < WX_READ_COUNT ? Step::RequestWeather : Step::Report;
+        if (step == Step::Report)
+            LOG_INFO("Weather: %u/7 values valid from Modbus addr %u", weatherValid, WX_MODBUS_ADDR);
         return step == Step::Report ? STEP_MS : WX_GAP_MS;
     }
 

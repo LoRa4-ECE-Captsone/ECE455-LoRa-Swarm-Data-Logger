@@ -70,6 +70,10 @@ class SondeModule : public SinglePortModule, private concurrency::OSThread
     uint32_t requestSentMs = 0;
     uint8_t rx[48] = {};
     size_t rxLen = 0;
+    uint8_t txFrame[16] = {};
+    size_t txLen = 0;
+    bool echoPending = false;
+    uint8_t weatherValid = 0;
 
     void powerSonde(bool on);
     void sendFrame(uint8_t *frame, size_t lenWithoutCrc);

@@ -204,6 +204,22 @@ def open_db():
     """)
     add_missing_columns(conn, "weather", LINK_COLUMNS)
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS weather_packet ON weather(packet_id)")
+    # DS18B20 temperature string: one row per reading, t1..tN in string order (columns added as probes appear).
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS temp_string (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT,
+        node_id INTEGER,
+        seq INTEGER,
+        simulated INTEGER,
+        probes INTEGER,
+        valid INTEGER,
+        latitude REAL,
+        longitude REAL
+    )
+    """)
+    add_missing_columns(conn, "temp_string", LINK_COLUMNS)
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS temp_string_packet ON temp_string(packet_id)")
     conn.execute("""
     CREATE TABLE IF NOT EXISTS nodes (
         node_id INTEGER PRIMARY KEY,
@@ -345,6 +361,37 @@ def store_weather(conn, data, packet=None, gateway_id=None):
 
 
 
+def store_temp_string(conn, data, packet=None, gateway_id=None):
+    node_id = int(data["node_id"])
+    temps = [as_float(v) for v in data.get("ts") or []]
+    row = {
+        "timestamp": local_time(measured_time(data)),
+        "node_id": node_id,
+        "seq": data.get("seq"),
+        "simulated": 1 if data.get("sim") else 0,
+        "probes": len(temps),
+        "valid": sum(t is not None for t in temps),
+        "latitude": as_float(data.get("lat")),
+        "longitude": as_float(data.get("lon")),
+        **link_fields(packet, gateway_id),
+    }
+    row.update({f"t{i}": t for i, t in enumerate(temps, 1)})
+    with db_lock:
+        add_missing_columns(conn, "temp_string", {f"t{i}": "REAL" for i in range(1, len(temps) + 1)})
+    if insert_row(conn, "temp_string", row):
+        print(f"[{row['timestamp']}] {node_hex(node_id)} temp string seq {row['seq']}: {row['valid']}/{row['probes']} probes {temps}")
+
+
+def store_reading(conn, data, packet=None, gateway_id=None):
+    kind = data.get("type")
+    if kind == "wx":
+        store_weather(conn, data, packet, gateway_id)
+    elif kind == "ts":
+        store_temp_string(conn, data, packet, gateway_id)
+    else:
+        store_measurement(conn, data, packet, gateway_id)
+
+
 def store_measurement(conn, data, packet=None, gateway_id=None):
     node_id = int(data["node_id"])
     measured = measured_time(data)
@@ -407,10 +454,7 @@ def on_receive(packet, interface, conn, gateway_id):
             data = json.loads(bytes(decoded.get("payload", b"")).decode("utf-8"))
             # Relayed packets keep their original sender, so a reading must come from the node it names.
             if "node_id" in data and int(data["node_id"]) == sender:
-                if data.get("type") == "wx":
-                    store_weather(conn, data, packet, gateway_id)
-                else:
-                    store_measurement(conn, data, packet, gateway_id)
+                store_reading(conn, data, packet, gateway_id)
             elif "node_id" in data:
                 print(f"Ignored reading claiming node {data['node_id']} sent by {packet.get('fromId')}")
         elif portnum in ("TELEMETRY_APP", "POSITION_APP"):
@@ -428,8 +472,7 @@ def run_stdin(conn):
         if not line:
             continue
         try:
-            data = json.loads(line)
-            (store_weather if data.get("type") == "wx" else store_measurement)(conn, data)
+            store_reading(conn, json.loads(line))
         except (json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
             print("Invalid message:", e)
 

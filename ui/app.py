@@ -1,6 +1,7 @@
 
 import html
 import math
+import re
 import sqlite3
 import os
 from datetime import datetime, timedelta
@@ -96,6 +97,7 @@ def node_hex(node_id):
 
 def load_table(name):
     df = pd.DataFrame()
+    from_cloud = False
 
     # Load water-quality measurements from Supabase.
     if name in ("measurements", "weather"):
@@ -117,6 +119,7 @@ def load_table(name):
                 )
 
                 df = pd.DataFrame(response.data)
+                from_cloud = not df.empty
 
                 # Match the data types expected by the existing dashboard.
                 if not df.empty:
@@ -150,11 +153,16 @@ def load_table(name):
 
     
     if "timestamp" in df.columns:
-        df["timestamp"] = (
-            pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
-            .dt.tz_convert("America/Chicago")
-            .dt.tz_localize(None)
-        )
+        if from_cloud:
+            # Supabase returns UTC timestamps; show them in local time.
+            df["timestamp"] = (
+                pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+                .dt.tz_convert("America/Chicago")
+                .dt.tz_localize(None)
+            )
+        else:
+            # The receiver writes local wall-clock time to SQLite.
+            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
 
         df = df.sort_values(
             ["timestamp", "id"] if "id" in df.columns else "timestamp",
@@ -203,6 +211,18 @@ def load_data(include_simulated):
         water = water[water["simulated"].fillna(0) == 0]
         weather = weather[weather["simulated"].fillna(0) == 0]
     return water, weather, status, invalid
+
+
+def load_temp_string(include_simulated):
+    """DS18B20 string readings plus the probe columns (t1..tN) in string order."""
+    ts = load_table("temp_string")
+    if ts.empty:
+        return ts, []
+    probes = sorted((c for c in ts.columns if re.fullmatch(r"t\d+", c)), key=lambda c: int(c[1:]))
+    ts = with_columns(ts, ["node_id", "timestamp", "valid", "probes", *LINK_COLUMNS])
+    if not include_simulated:
+        ts = ts[ts["simulated"].fillna(0) == 0]
+    return ts, probes
 
 
 def in_window(df, minutes):
@@ -517,6 +537,88 @@ def weather_cards(weather, names, invalid):
     ])
 
 
+def temp_string_summary(ts, probes):
+    row = latest_row(ts, probes) if probes else None
+    if row is None:
+        return None
+    present = [(int(c[1:]), row[c]) for c in probes if pd.notna(row[c])]
+    return row, present
+
+
+def temp_string_cards(ts, probes, names, compact=False):
+    summary = temp_string_summary(ts, probes)
+    if summary is None:
+        st.caption("No temperature string readings yet.")
+        return
+    row, present = summary
+    sub = f"{display_name(row['node_id'], names)} · {clock(row['timestamp'])}"
+    (top_pos, top), (bottom_pos, bottom) = present[0], present[-1]
+    if compact:
+        cards([("Temperature string", f"{fmt(top, '°C', 1)} → {fmt(bottom, '°C', 1)}",
+                f"T{top_pos} → T{bottom_pos} · {len(present)}/{len(probes)} probes · {clock(row['timestamp'])}")])
+        return
+    cards([
+        ("Probes reporting", f"{len(present)} / {len(probes)}", sub),
+        (f"Top (T{top_pos})", fmt(top, "°C", 2), sub),
+        (f"Bottom (T{bottom_pos})", fmt(bottom, "°C", 2), sub),
+        ("Top − bottom", fmt(top - bottom, "°C", 2), "positive = warmer at the top"),
+    ])
+
+
+def temp_string_long(ts, probes, names):
+    long = ts.melt(id_vars=["node_id", "timestamp"], value_vars=probes, var_name="probe", value_name="temp")
+    long = long.dropna(subset=["temp"])
+    long["position"] = long["probe"].str[1:].astype(int)
+    long["node"] = [display_name(n, names) for n in long["node_id"]]
+    return long
+
+
+def temp_profile_chart(ts, probes, names, height=320):
+    latest = ts.dropna(subset=probes, how="all").groupby("node_id").tail(1)
+    long = temp_string_long(latest, probes, names)
+    if long.empty:
+        st.caption("No temperature string readings yet.")
+        return
+    chart = (
+        alt.Chart(long)
+        .mark_line(point=True, strokeWidth=2)
+        .encode(
+            x=alt.X("temp:Q", title="Temperature (°C)", scale=alt.Scale(zero=False)),
+            y=alt.Y("position:Q", title="Probe (1 = top of string)", scale=alt.Scale(reverse=True, domain=[1, len(probes)]),
+                    axis=alt.Axis(tickMinStep=1, format="d")),
+            order="position:Q",
+            color=alt.Color("node:N", title=None, legend=alt.Legend(orient="top") if long["node"].nunique() > 1 else None),
+            tooltip=["node:N", alt.Tooltip("position:Q", title="Probe"), alt.Tooltip("temp:Q", title="°C", format=".2f")],
+        )
+        .properties(height=height, width="container")
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+
+def temp_trend_chart(ts, probes, names, height=320):
+    long = temp_string_long(ts, probes, names)
+    if long.empty:
+        st.caption("No temperature string readings in this time range.")
+        return
+    several = long["node"].nunique() > 1
+    long["series"] = [f"{n} T{p}" if several else f"T{p}" for n, p in zip(long["node"], long["position"])]
+    order = sorted(long["series"].unique(), key=lambda s: (s.rsplit("T", 1)[0], int(s.rsplit("T", 1)[1])))
+    chart = (
+        alt.Chart(long)
+        .mark_line(strokeWidth=1.5, interpolate="monotone")
+        .encode(
+            x=alt.X("timestamp:T", title=None, axis=alt.Axis(labelAngle=0, tickCount=6, grid=False)),
+            y=alt.Y("temp:Q", title="Temperature (°C)", scale=alt.Scale(zero=False)),
+            color=alt.Color("series:N", title=None, sort=order, scale=alt.Scale(scheme="viridis"),
+                            legend=alt.Legend(orient="right", columns=1)),
+            tooltip=[alt.Tooltip("timestamp:T", title="Time", format="%I:%M:%S %p"), "series:N",
+                     alt.Tooltip("temp:Q", title="°C", format=".2f")],
+        )
+        .properties(height=height, width="container")
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+
 def sonde_alerts(water, names):
     for node_id, rows in water.groupby("node_id"):
         last = rows.iloc[-1]
@@ -599,7 +701,26 @@ def export_tables(water, weather, names):
     return water_table, weather_table
 
 
-def excel_bytes(water_table, weather_table):
+def temp_string_table(ts, probes, names):
+    if ts.empty or not probes:
+        return pd.DataFrame()
+    out = ts.assign(
+        node=[display_name(n, names) for n in ts["node_id"]],
+        node_hex=[node_hex(n) for n in ts["node_id"]],
+        received_by=[received_by(row, names) for _, row in ts.iterrows()],
+    ).iloc[::-1]
+    keep = ["timestamp", "node", "node_hex", "valid", *probes, "latitude", "longitude", "rx_rssi", "rx_snr", "hops", "received_by"]
+    out = out[[c for c in keep if c in out.columns and out[c].notna().any()]]
+    out = out.rename(columns={
+        "timestamp": "Timestamp", "node": "Node", "node_hex": "Node ID", "valid": "Probes Reporting",
+        **{c: f"T{c[1:]} (C)" for c in probes}, "latitude": "Latitude", "longitude": "Longitude",
+        "rx_rssi": "RSSI (dBm)", "rx_snr": "SNR (dB)", "hops": "Hops", "received_by": "Received By",
+    })
+    out["Timestamp"] = out["Timestamp"].dt.strftime("%m/%d/%Y %I:%M:%S %p")
+    return out
+
+
+def excel_bytes(water_table, weather_table, ts_table=None):
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         (water_table if not water_table.empty else pd.DataFrame({"Info": ["No water data"]})).to_excel(
@@ -607,6 +728,8 @@ def excel_bytes(water_table, weather_table):
         )
         if not weather_table.empty:
             weather_table.to_excel(writer, index=False, sheet_name="Weather")
+        if ts_table is not None and not ts_table.empty:
+            ts_table.to_excel(writer, index=False, sheet_name="Temperature String")
     return output.getvalue()
 
 
@@ -656,7 +779,8 @@ def live_view(view, node, metric_key, window_label, include_simulated, choices):
     names = load_names()
     presence = load_presence()
     water, weather, status, invalid = load_data(include_simulated)
-    if water.empty and weather.empty:
+    temp_string, probes = load_temp_string(include_simulated)
+    if water.empty and weather.empty and temp_string.empty:
         st.info("No data received yet. Start the receiver with `./dashboard.sh start` and power a sensor node.")
         return
     # Rebuild the sidebar when a new node, node name, or measurement type shows up.
@@ -666,6 +790,8 @@ def live_view(view, node, metric_key, window_label, include_simulated, choices):
     minutes = WINDOWS[window_label]
     water_now, weather_now = for_node(water, node), for_node(weather, node)
     water_win, weather_win = in_window(water_now, minutes), in_window(weather_now, minutes)
+    ts_now = for_node(temp_string, node)
+    ts_win = in_window(ts_now, minutes)
     table, column, label, unit, decimals = metric_spec(metric_key)
 
     if view == "Overview":
@@ -675,6 +801,8 @@ def live_view(view, node, metric_key, window_label, include_simulated, choices):
         with left:
             section("Water quality")
             water_cards(water_now, names)
+            if probes and not ts_now.empty:
+                temp_string_cards(ts_now, probes, names, compact=True)
         with right:
             section("Weather")
             weather_cards(weather_now, names, invalid)
@@ -700,6 +828,18 @@ def live_view(view, node, metric_key, window_label, include_simulated, choices):
                     name, unit_c, _ = WATER[c]
                     section(name)
                     line_chart(water_win, c, f"{name} ({unit_c})" if unit_c else name, names)
+        section("Temperature string")
+        if not probes or ts_now.empty:
+            st.caption("No temperature string readings yet.")
+        else:
+            temp_string_cards(ts_now, probes, names)
+            profile_col, trend_col = st.columns([2, 3], gap="medium")
+            with profile_col:
+                section("Latest profile")
+                temp_profile_chart(ts_now, probes, names)
+            with trend_col:
+                section(f"Each probe · {window_label.lower()}")
+                temp_trend_chart(ts_win, probes, names)
 
     elif view == "Weather":
         weather_cards(weather_now, names, invalid)
@@ -732,14 +872,19 @@ def live_view(view, node, metric_key, window_label, include_simulated, choices):
 
     elif view == "Data":
         water_table, weather_table = export_tables(water_win, weather_win, names)
-        water_tab, weather_tab = st.tabs([f"Water quality ({len(water_table)})", f"Weather ({len(weather_table)})"])
+        ts_table = temp_string_table(ts_win, probes, names)
+        water_tab, weather_tab, ts_tab = st.tabs([
+            f"Water quality ({len(water_table)})", f"Weather ({len(weather_table)})", f"Temperature string ({len(ts_table)})",
+        ])
         with water_tab:
             st.dataframe(water_table, width="stretch", hide_index=True, height=460)
         with weather_tab:
             st.dataframe(weather_table, width="stretch", hide_index=True, height=460)
+        with ts_tab:
+            st.dataframe(ts_table, width="stretch", hide_index=True, height=460)
         st.download_button(
             "Export to Excel",
-            data=excel_bytes(water_table, weather_table),
+            data=excel_bytes(water_table, weather_table, ts_table),
             file_name=f"lake_swarm_{datetime.now():%Y%m%d_%H%M}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )

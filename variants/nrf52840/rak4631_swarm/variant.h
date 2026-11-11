@@ -237,6 +237,11 @@ SO GPIO 39/TXEN MAY NOT BE DEFINED FOR SUCCESSFUL OPERATION OF THE SX1262 - TG
 // Y4000 12 V load switch enable, active high. P0.28 = header pin "IO7" on the RAK19001. Set -1 if always powered.
 #define SONDE_POWER_PIN 28
 
+// DS18B20 temperature string on 1-Wire: IO1 = P0.17 (RAK19001 header "IO1"), 4.7k pull-up to 3.3 V.
+// Probe ROM codes and their order along the string are in temp_string_ids.h.
+#define HAS_TEMP_STRING 1
+#define TEMP_STRING_PIN 17
+
 // Freshly flashed swarm boards come up as "Swarm xxxx" (last 4 hex digits of the node ID).
 #define OWNER_LONG_NAME_PREFIX "Swarm"
 
