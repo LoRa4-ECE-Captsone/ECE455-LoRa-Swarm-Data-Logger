@@ -106,11 +106,25 @@ def node_hex(node_id):
 
 
 
+def setting(name):
+    """Streamlit secrets (Streamlit Cloud, .streamlit/secrets.toml) first, then ui/.env or the environment."""
+    try:
+        value = st.secrets.get(name)
+    except Exception:  # no secrets file when running locally
+        value = None
+    return value or os.getenv(name)
+
+
 @st.cache_resource
+def cached_client(url, key):
+    return create_client(url, key)
+
+
 def supabase_client():
+    # Only a real client is cached (keyed by url/key), so secrets added after startup take effect without a reboot.
     load_dotenv(Path(__file__).resolve().parent / ".env")
-    url, key = os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY")
-    return create_client(url, key) if url and key else None
+    url, key = setting("SUPABASE_URL"), setting("SUPABASE_KEY")
+    return cached_client(url, key) if url and key else None
 
 
 def load_table(name):
@@ -186,8 +200,8 @@ def load_table(name):
 def data_source_note():
     fallback = {CLOUD_TABLES[t]: why for t, why in DATA_SOURCE.items() if why != "supabase"}
     if fallback and set(fallback.values()) == {"not configured"}:
-        st.warning("Supabase isn't configured (ui/.env needs SUPABASE_URL and SUPABASE_KEY), so this page is showing "
-                   "the local sensor_data.db.")
+        st.warning("Supabase isn't configured: set SUPABASE_URL and SUPABASE_KEY (the publishable key) in the app's "
+                   "Streamlit secrets or ui/.env. Until then this page shows the local sensor_data.db.")
     elif fallback:
         st.caption("Data source: Supabase · local sensor_data.db for "
                    + ", ".join(f"{label} ({why})" for label, why in fallback.items()))
