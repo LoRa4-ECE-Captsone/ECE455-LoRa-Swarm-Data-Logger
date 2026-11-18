@@ -7,6 +7,7 @@
 #include "SinglePortModule.h"
 #include "concurrency/OSThread.h"
 #include "temp_string_ids.h"
+#include <DallasTemperature.h>
 #include <OneWire.h>
 
 /**
@@ -27,6 +28,7 @@ class TempStringModule : public SinglePortModule, private concurrency::OSThread
     enum class Step : uint8_t { Boot, Convert, Read, Report };
 
     OneWire bus;
+    DallasTemperature sensors;
     Step step = Step::Boot;
     float temps[TEMP_STRING_COUNT] = {};
     uint8_t index = 0;

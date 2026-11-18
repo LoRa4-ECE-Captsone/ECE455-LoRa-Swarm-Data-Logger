@@ -77,13 +77,19 @@ MAP_METRICS = {f"water:{c}": ("water", c) for c in WATER} | {
     f"weather:{c}": ("weather", c) for c in WEATHER if c != "wind_dir"
 }
 WINDOWS = {"Last 15 min": 15, "Last hour": 60, "Last 6 hours": 360, "Last 24 hours": 1440, "All time": None}
-VIEWS = ["Overview", "Water", "Weather", "Network", "Data"]
+VIEWS = ["Overview", "Water", "Temp Profile", "Weather", "Network", "Data"]
+# Temperature string geometry: probe 1 hangs 1 ft below the surface, then one probe every foot.
+PROBE_TOP_FT = 1.0
+PROBE_SPACING_FT = 1.0
+# Long time ranges are averaged into at most this many heat-map columns.
+HEATMAP_MAX_COLUMNS = 120
 # Relays only transmit telemetry every few minutes (provision.py sets 5 min), so allow two intervals.
 ON_WINDOW = timedelta(minutes=10)
 PLUGGED_WINDOW = timedelta(seconds=20)
 COMPASS = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
 # Heat-map ramp: blue (lowest) -> cyan -> yellow -> red (highest).
 RAMP = np.array([[49, 54, 149], [69, 170, 220], [254, 224, 100], [215, 48, 39]])
+RAMP_HEX = ["#%02x%02x%02x" % tuple(c) for c in RAMP]
 LINK_COLUMNS = ["rx_rssi", "rx_snr", "hops", "gateway_id", "seq", "received_at", "latitude", "longitude", "simulated"]
 
 
@@ -305,6 +311,10 @@ def cards(items):
     st.markdown(f'<div class="kpi-grid">{"".join(parts)}</div>', unsafe_allow_html=True)
 
 
+def time_axis_format(span):
+    return "%H:%M:%S" if span < timedelta(minutes=10) else "%H:%M" if span < timedelta(days=1) else "%b %d %H:%M"
+
+
 def line_chart(df, column, title, names, height=220):
     data = df.dropna(subset=[column])
     if data.empty:
@@ -312,12 +322,11 @@ def line_chart(df, column, title, names, height=220):
         return
     data = data.assign(node=[display_name(n, names) for n in data["node_id"]])[["timestamp", "node", column]]
     span = data["timestamp"].max() - data["timestamp"].min()
-    axis_format = "%H:%M:%S" if span < timedelta(minutes=10) else "%H:%M" if span < timedelta(days=1) else "%b %d %H:%M"
     chart = (
         alt.Chart(data)
         .mark_line(strokeWidth=2, interpolate="monotone")
         .encode(
-            x=alt.X("timestamp:T", title=None, axis=alt.Axis(format=axis_format, labelAngle=0, tickCount=6, grid=False)),
+            x=alt.X("timestamp:T", title=None, axis=alt.Axis(format=time_axis_format(span), labelAngle=0, tickCount=6, grid=False)),
             y=alt.Y(f"{column}:Q", title=title, scale=alt.Scale(zero=False)),
             color=alt.Color("node:N", title=None, legend=alt.Legend(orient="top") if data["node"].nunique() > 1 else None),
             tooltip=[alt.Tooltip("timestamp:T", title="Time", format="%I:%M:%S %p"), "node:N", alt.Tooltip(f"{column}:Q", title=title)],
@@ -537,6 +546,18 @@ def weather_cards(weather, names, invalid):
     ])
 
 
+def probe_depth_ft(position):
+    return PROBE_TOP_FT + (position - 1) * PROBE_SPACING_FT
+
+
+def fmt_depth(position):
+    return f"{probe_depth_ft(position):g} ft"
+
+
+def probe_depths(count):
+    return [probe_depth_ft(p) for p in range(1, count + 1)]
+
+
 def temp_string_summary(ts, probes):
     row = latest_row(ts, probes) if probes else None
     if row is None:
@@ -555,12 +576,12 @@ def temp_string_cards(ts, probes, names, compact=False):
     (top_pos, top), (bottom_pos, bottom) = present[0], present[-1]
     if compact:
         cards([("Temperature string", f"{fmt(top, '°C', 1)} → {fmt(bottom, '°C', 1)}",
-                f"T{top_pos} → T{bottom_pos} · {len(present)}/{len(probes)} probes · {clock(row['timestamp'])}")])
+                f"{fmt_depth(top_pos)} → {fmt_depth(bottom_pos)} · {len(present)}/{len(probes)} probes · {clock(row['timestamp'])}")])
         return
     cards([
         ("Probes reporting", f"{len(present)} / {len(probes)}", sub),
-        (f"Top (T{top_pos})", fmt(top, "°C", 2), sub),
-        (f"Bottom (T{bottom_pos})", fmt(bottom, "°C", 2), sub),
+        (f"Top ({fmt_depth(top_pos)})", fmt(top, "°C", 2), sub),
+        (f"Bottom ({fmt_depth(bottom_pos)})", fmt(bottom, "°C", 2), sub),
         ("Top − bottom", fmt(top - bottom, "°C", 2), "positive = warmer at the top"),
     ])
 
@@ -569,6 +590,7 @@ def temp_string_long(ts, probes, names):
     long = ts.melt(id_vars=["node_id", "timestamp"], value_vars=probes, var_name="probe", value_name="temp")
     long = long.dropna(subset=["temp"])
     long["position"] = long["probe"].str[1:].astype(int)
+    long["depth"] = probe_depth_ft(long["position"])
     long["node"] = [display_name(n, names) for n in long["node_id"]]
     return long
 
@@ -584,11 +606,12 @@ def temp_profile_chart(ts, probes, names, height=320):
         .mark_line(point=True, strokeWidth=2)
         .encode(
             x=alt.X("temp:Q", title="Temperature (°C)", scale=alt.Scale(zero=False)),
-            y=alt.Y("position:Q", title="Probe (1 = top of string)", scale=alt.Scale(reverse=True, domain=[1, len(probes)]),
-                    axis=alt.Axis(tickMinStep=1, format="d")),
-            order="position:Q",
+            y=alt.Y("depth:Q", title="Depth (ft)", scale=alt.Scale(reverse=True, domain=[0, probe_depth_ft(len(probes))]),
+                    axis=alt.Axis(values=probe_depths(len(probes)), format="~g")),
+            order="depth:Q",
             color=alt.Color("node:N", title=None, legend=alt.Legend(orient="top") if long["node"].nunique() > 1 else None),
-            tooltip=["node:N", alt.Tooltip("position:Q", title="Probe"), alt.Tooltip("temp:Q", title="°C", format=".2f")],
+            tooltip=["node:N", alt.Tooltip("depth:Q", title="Depth (ft)"), alt.Tooltip("position:Q", title="Probe"),
+                     alt.Tooltip("temp:Q", title="°C", format=".2f")],
         )
         .properties(height=height, width="container")
     )
@@ -601,8 +624,8 @@ def temp_trend_chart(ts, probes, names, height=320):
         st.caption("No temperature string readings in this time range.")
         return
     several = long["node"].nunique() > 1
-    long["series"] = [f"{n} T{p}" if several else f"T{p}" for n, p in zip(long["node"], long["position"])]
-    order = sorted(long["series"].unique(), key=lambda s: (s.rsplit("T", 1)[0], int(s.rsplit("T", 1)[1])))
+    long["series"] = [f"{n} · {d:g} ft" if several else f"{d:g} ft" for n, d in zip(long["node"], long["depth"])]
+    order = long.sort_values(["node", "position"])["series"].unique().tolist()
     chart = (
         alt.Chart(long)
         .mark_line(strokeWidth=1.5, interpolate="monotone")
@@ -617,6 +640,52 @@ def temp_trend_chart(ts, probes, names, height=320):
         .properties(height=height, width="container")
     )
     st.altair_chart(chart, use_container_width=True)
+
+
+def temp_depth_heatmap(ts, probes, names, height=380):
+    long = temp_string_long(ts, probes, names)
+    if long.empty:
+        st.caption("No temperature string readings in this time range.")
+        return
+    several = long["node"].nunique() > 1
+    deepest = probe_depth_ft(len(probes))
+    for node, rows in long.groupby("node"):
+        stamps = rows["timestamp"].drop_duplicates().sort_values()
+        interval = stamps.diff().median() if len(stamps) > 1 else pd.NaT
+        if pd.isna(interval) or interval <= timedelta(0):
+            interval = timedelta(seconds=30)
+        span = stamps.iloc[-1] - stamps.iloc[0]
+        secs = max(1, math.ceil(max(interval, span / HEATMAP_MAX_COLUMNS).total_seconds()))
+        cells = (
+            rows.assign(start=rows["timestamp"].dt.floor(f"{secs}s"))
+            .groupby(["start", "position"], as_index=False)["temp"].mean()
+        )
+        # Overlapping each column slightly into the next hides anti-aliasing seams between adjacent cells.
+        cells["end"] = cells["start"] + pd.Timedelta(seconds=secs * 1.02)
+        cells["depth"] = probe_depth_ft(cells["position"])
+        # Each probe is a point measurement, so rows keep a small gap instead of blending into a continuous field.
+        cells["top"] = cells["depth"] - PROBE_SPACING_FT * 0.45
+        cells["bottom"] = cells["depth"] + PROBE_SPACING_FT * 0.45
+        chart = (
+            alt.Chart(cells)
+            .mark_rect()
+            .encode(
+                x=alt.X("start:T", title=None, axis=alt.Axis(format=time_axis_format(span), labelAngle=0, tickCount=6, grid=False)),
+                x2="end:T",
+                y=alt.Y("top:Q", title="Depth (ft)", axis=alt.Axis(values=probe_depths(len(probes)), format="~g", grid=False),
+                        scale=alt.Scale(reverse=True, nice=False, domain=[0, deepest + PROBE_SPACING_FT / 2])),
+                y2="bottom:Q",
+                color=alt.Color("temp:Q", title="°C", scale=alt.Scale(range=RAMP_HEX, zero=False),
+                                legend=alt.Legend(orient="right", gradientLength=max(120, height - 90))),
+                tooltip=[alt.Tooltip("start:T", title="Time", format="%b %d %I:%M:%S %p"),
+                         alt.Tooltip("depth:Q", title="Depth (ft)"), alt.Tooltip("position:Q", title="Probe"),
+                         alt.Tooltip("temp:Q", title="°C", format=".2f")],
+            )
+            .properties(height=height, width="container", title=node if several else "")
+        )
+        st.altair_chart(chart, use_container_width=True)
+        if secs > interval.total_seconds() * 1.5:
+            st.caption(f"Each column averages {timedelta(seconds=secs)} of readings.")
 
 
 def sonde_alerts(water, names):
@@ -713,7 +782,7 @@ def temp_string_table(ts, probes, names):
     out = out[[c for c in keep if c in out.columns and out[c].notna().any()]]
     out = out.rename(columns={
         "timestamp": "Timestamp", "node": "Node", "node_hex": "Node ID", "valid": "Probes Reporting",
-        **{c: f"T{c[1:]} (C)" for c in probes}, "latitude": "Latitude", "longitude": "Longitude",
+        **{c: f"T{c[1:]} {fmt_depth(int(c[1:]))} (C)" for c in probes}, "latitude": "Latitude", "longitude": "Longitude",
         "rx_rssi": "RSSI (dBm)", "rx_snr": "SNR (dB)", "hops": "Hops", "received_by": "Received By",
     })
     out["Timestamp"] = out["Timestamp"].dt.strftime("%m/%d/%Y %I:%M:%S %p")
@@ -828,11 +897,14 @@ def live_view(view, node, metric_key, window_label, include_simulated, choices):
                     name, unit_c, _ = WATER[c]
                     section(name)
                     line_chart(water_win, c, f"{name} ({unit_c})" if unit_c else name, names)
-        section("Temperature string")
+
+    elif view == "Temp Profile":
         if not probes or ts_now.empty:
             st.caption("No temperature string readings yet.")
         else:
             temp_string_cards(ts_now, probes, names)
+            section(f"Water temperature by depth · {window_label.lower()}")
+            temp_depth_heatmap(ts_win, probes, names)
             profile_col, trend_col = st.columns([2, 3], gap="medium")
             with profile_col:
                 section("Latest profile")

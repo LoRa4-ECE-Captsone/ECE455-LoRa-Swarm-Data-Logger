@@ -19,13 +19,11 @@ static constexpr int32_t FIRST_CYCLE_DELAY_MS = 20 * 1000;
 static constexpr int32_t CONVERSION_MS = 800; // 12-bit conversion takes 750 ms
 static constexpr int32_t STEP_MS = 20;
 static constexpr uint32_t BUS_WARN_INTERVAL_MS = 10 * 60 * 1000;
-static constexpr uint8_t READ_ATTEMPTS = 2;
-
-static constexpr uint8_t CMD_CONVERT_T = 0x44;
-static constexpr uint8_t CMD_READ_SCRATCHPAD = 0xBE;
+static constexpr uint8_t READ_RETRIES = 1;
 
 TempStringModule::TempStringModule()
-    : SinglePortModule("tempstring", meshtastic_PortNum_PRIVATE_APP), concurrency::OSThread("TempString"), bus(TEMP_STRING_PIN)
+    : SinglePortModule("tempstring", meshtastic_PortNum_PRIVATE_APP), concurrency::OSThread("TempString"), bus(TEMP_STRING_PIN),
+      sensors(&bus)
 {
 }
 
@@ -37,20 +35,21 @@ static void formatRom(const uint8_t *rom, char *out)
 
 void TempStringModule::discover()
 {
-    if (!bus.reset()) {
+    sensors.begin();
+    sensors.setWaitForConversion(false);
+    const uint8_t total = sensors.getDeviceCount();
+    if (total == 0) {
         LOG_WARN("TempString: no 1-Wire devices answer on pin %u (check wiring and the 4.7k pull-up to 3.3 V)", TEMP_STRING_PIN);
         return;
     }
+    sensors.setResolution(12);
 
     bool matched[TEMP_STRING_COUNT] = {};
-    uint8_t rom[8];
-    uint8_t total = 0;
+    DeviceAddress rom;
     char text[24];
-    bus.reset_search();
-    while (bus.search(rom) && total < 64) {
-        if (OneWire::crc8(rom, 7) != rom[7])
+    for (uint8_t d = 0; d < total; d++) {
+        if (!sensors.getAddress(rom, d))
             continue;
-        total++;
         bool known = false;
         for (uint8_t i = 0; i < TEMP_STRING_COUNT; i++) {
             if (memcmp(rom, TEMP_STRING_ROMS[i], 8) == 0) {
@@ -73,35 +72,15 @@ void TempStringModule::discover()
             LOG_WARN("TempString: probe %u (%s) not found", i + 1, text);
         }
     }
-    LOG_INFO("TempString: %u/%u listed probes found on pin %u (%u devices on bus)", found, TEMP_STRING_COUNT, TEMP_STRING_PIN,
-             total);
+    LOG_INFO("TempString: %u/%u listed probes found on pin %u (%u devices on bus%s)", found, TEMP_STRING_COUNT, TEMP_STRING_PIN,
+             total, sensors.isParasitePowerMode() ? ", parasite power" : "");
 }
 
 float TempStringModule::readProbe(const uint8_t *rom)
 {
-    for (uint8_t attempt = 0; attempt < READ_ATTEMPTS; attempt++) {
-        if (!bus.reset())
-            continue;
-        bus.select(rom);
-        bus.write(CMD_READ_SCRATCHPAD);
-        uint8_t d[9];
-        bus.read_bytes(d, sizeof(d));
-
-        // A missing probe reads all ones and a shorted line all zeros; the config byte rules both out.
-        if (OneWire::crc8(d, 8) != d[8] || (d[4] & 0x9F) != 0x1F)
-            continue;
-
-        int16_t raw = (int16_t)((d[1] << 8) | d[0]);
-        const uint8_t resolutionBits = 9 + ((d[4] >> 5) & 0x03);
-        raw &= ~((1 << (12 - resolutionBits)) - 1); // low bits are undefined below 12-bit resolution
-        const float celsius = raw / 16.0f;
-
-        // 85.0 C is the power-on value: this probe never ran its conversion.
-        if (celsius < -55.0f || celsius >= 85.0f)
-            continue;
-        return celsius;
-    }
-    return NAN;
+    // DallasTemperature's error codes are all below -55 C; 85 C is the power-on value of a probe that never converted.
+    const float celsius = sensors.getTempC(rom, READ_RETRIES);
+    return celsius < -55.0f || celsius >= 85.0f ? NAN : celsius;
 }
 
 void TempStringModule::simulate()
@@ -171,15 +150,12 @@ int32_t TempStringModule::runOnce()
             }
             return swarm::msUntilNextSlot();
         }
-        // Start every probe at once; power=1 holds the line high so parasite-powered probes can convert too.
-        bus.skip();
-        bus.write(CMD_CONVERT_T, 1);
+        // Non-blocking: starts every probe at once, then the conversion time is spent off this thread.
+        sensors.requestTemperatures();
         step = Step::Read;
         return CONVERSION_MS;
 
     case Step::Read:
-        if (index == 0)
-            bus.depower();
         temps[index] = readProbe(TEMP_STRING_ROMS[index]);
         if (!isnan(temps[index]))
             valid++;
