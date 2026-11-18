@@ -72,3 +72,5 @@ __pycache__/
 # Dashboard runtime logs
 ui/logs/
 ui/.swarm_channel.json
+# Supabase URL and keys for receiver.py / app.py
+ui/.env

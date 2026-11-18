@@ -41,6 +41,11 @@ st.markdown(
 )
 
 DB_FILE = Path(__file__).resolve().parent / "sensor_data.db"
+# Tables read from Supabase (ui/.env: SUPABASE_URL + SUPABASE_KEY); the rest are local receiver state.
+CLOUD_TABLES = {"measurements": "Sonde", "weather": "Weather", "temp_string": "Temp string"}
+CLOUD_ROW_LIMIT = 1000
+# Where each cloud table was last read from: "supabase", or why it fell back to sensor_data.db.
+DATA_SOURCE = {}
 
 # column -> (label, unit, decimals)
 WATER = {
@@ -101,44 +106,39 @@ def node_hex(node_id):
 
 
 
+@st.cache_resource
+def supabase_client():
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+    url, key = os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY")
+    return create_client(url, key) if url and key else None
+
+
 def load_table(name):
     df = pd.DataFrame()
     from_cloud = False
 
-    # Load water-quality measurements from Supabase.
-    if name in ("measurements", "weather"):
+    # Sensor readings come from Supabase; local-only tables and any failed cloud read use SQLite.
+    if name in CLOUD_TABLES:
         try:
-            load_dotenv(Path(__file__).resolve().parent / ".env")
-
-            url = os.getenv("SUPABASE_URL")
-            key = os.getenv("SUPABASE_KEY")
-
-            if url and key:
-                supabase = create_client(url, key)
-
-                response = (
-                    supabase.table(name)
-                    .select("*")
-                    .order("timestamp", desc=True)
-                    .limit(1000)
-                    .execute()
-                )
-
+            client = supabase_client()
+            if client is None:
+                DATA_SOURCE[name] = "not configured"
+            else:
+                response = client.table(name).select("*").order("timestamp", desc=True).limit(CLOUD_ROW_LIMIT).execute()
                 df = pd.DataFrame(response.data)
                 from_cloud = not df.empty
-
-                # Match the data types expected by the existing dashboard.
-                if not df.empty:
-                    df["node_id"] = pd.to_numeric(
-                        df["node_id"], errors="coerce"
-                )
-                df = df.dropna(subset=["node_id"]).copy()
-                df["node_id"] = df["node_id"].astype(int)
-                df["simulated"] = df["simulated"].fillna(False).astype(int)
-        
-
+                DATA_SOURCE[name] = "supabase" if from_cloud else "empty in Supabase"
+                if from_cloud:
+                    if "packet_id" in df.columns:
+                        df = df[df["packet_id"].isna() | ~df["packet_id"].duplicated()].copy()
+                    df["node_id"] = pd.to_numeric(df["node_id"], errors="coerce")
+                    df = df.dropna(subset=["node_id"]).copy()
+                    df["node_id"] = df["node_id"].astype(int)
+                    if "simulated" in df.columns:
+                        df["simulated"] = df["simulated"].fillna(False).astype(int)
         except Exception as e:
-            print(f"Supabase read failed: {e}")
+            print(f"Supabase read of {name} failed: {e}")
+            DATA_SOURCE[name] = "read failed"
             df = pd.DataFrame()
 
     # Continue using SQLite for other tables and as a fallback.
@@ -166,6 +166,9 @@ def load_table(name):
                 .dt.tz_convert("America/Chicago")
                 .dt.tz_localize(None)
             )
+            # Older receivers upload without packet_id, so one reading can arrive once per base station.
+            if "packet_id" in df.columns:
+                df = df.sort_values("packet_id", na_position="last").drop_duplicates(["node_id", "timestamp"])
         else:
             # The receiver writes local wall-clock time to SQLite.
             df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
@@ -178,6 +181,18 @@ def load_table(name):
 
     return df
 
+
+
+def data_source_note():
+    fallback = {CLOUD_TABLES[t]: why for t, why in DATA_SOURCE.items() if why != "supabase"}
+    if fallback and set(fallback.values()) == {"not configured"}:
+        st.warning("Supabase isn't configured (ui/.env needs SUPABASE_URL and SUPABASE_KEY), so this page is showing "
+                   "the local sensor_data.db.")
+    elif fallback:
+        st.caption("Data source: Supabase · local sensor_data.db for "
+                   + ", ".join(f"{label} ({why})" for label, why in fallback.items()))
+    else:
+        st.caption("Data source: Supabase")
 
 
 def with_columns(df, columns):
@@ -849,6 +864,7 @@ def live_view(view, node, metric_key, window_label, include_simulated, choices):
     presence = load_presence()
     water, weather, status, invalid = load_data(include_simulated)
     temp_string, probes = load_temp_string(include_simulated)
+    data_source_note()
     if water.empty and weather.empty and temp_string.empty:
         st.info("No data received yet. Start the receiver with `./dashboard.sh start` and power a sensor node.")
         return

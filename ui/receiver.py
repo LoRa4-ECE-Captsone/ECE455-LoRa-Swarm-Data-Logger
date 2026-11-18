@@ -87,34 +87,8 @@ def initialize_supabase():
         print(f"Supabase initialization failed: {e}")
 
 
-def upload_to_supabase(row):
-    if supabase_client is None:
-        return
-
-    # Only include fields that exist in the cloud table.
-    cloud_row = {
-        "timestamp": datetime.strptime(
-            row["timestamp"], "%Y-%m-%d %H:%M:%S"
-        ).astimezone().isoformat(),
-        "node_id": str(row["node_id"]),
-        "water_temp": row.get("water_temp"),
-        "ph": row.get("ph"),
-        "conductivity": row.get("conductivity"),
-        "dissolved_oxygen": row.get("dissolved_oxygen"),
-        "turbidity": row.get("turbidity"),
-        "latitude": row.get("latitude"),
-        "longitude": row.get("longitude"),
-        "simulated": bool(row.get("simulated")),
-    }
-
-    try:
-        supabase_client.table("measurements").insert(cloud_row).execute()
-        print(f"Cloud upload successful: node {row['node_id']}")
-    except Exception as e:
-        print(f"Cloud upload failed (local data preserved): {e}")
-
-
-def upload_weather_to_supabase(row):
+def upload_row_to_supabase(table, row):
+    """Upload a measurements, weather or temp_string row as-is; each cloud table mirrors the SQLite columns."""
     if supabase_client is None:
         return
 
@@ -133,10 +107,15 @@ def upload_weather_to_supabase(row):
             )
 
     try:
-        supabase_client.table("weather").insert(cloud_row).execute()
-        print(f"Weather cloud upload successful: node {row['node_id']}")
+        query = supabase_client.table(table)
+        # Every base station uploads what it hears; the unique packet_id index keeps one row per packet.
+        if cloud_row.get("packet_id") is not None:
+            query.upsert(cloud_row, on_conflict="packet_id", ignore_duplicates=True).execute()
+        else:
+            query.insert(cloud_row).execute()
+        print(f"{table} cloud upload successful: node {row['node_id']}")
     except Exception as e:
-        print(f"Weather cloud upload failed (local data preserved): {e}")
+        print(f"{table} cloud upload failed (local data preserved): {e}")
 
 
 def add_missing_columns(conn, table, columns):
@@ -357,7 +336,7 @@ def store_weather(conn, data, packet=None, gateway_id=None):
     
     if insert_row(conn, "weather", row):
         print(f"[{row['timestamp']}] {node_hex(node_id)} weather seq {row['seq']}: {data}")
-        upload_weather_to_supabase(row)
+        upload_row_to_supabase("weather", row)
 
 
 
@@ -380,6 +359,7 @@ def store_temp_string(conn, data, packet=None, gateway_id=None):
         add_missing_columns(conn, "temp_string", {f"t{i}": "REAL" for i in range(1, len(temps) + 1)})
     if insert_row(conn, "temp_string", row):
         print(f"[{row['timestamp']}] {node_hex(node_id)} temp string seq {row['seq']}: {row['valid']}/{row['probes']} probes {temps}")
+        upload_row_to_supabase("temp_string", row)
 
 
 def store_reading(conn, data, packet=None, gateway_id=None):
@@ -412,7 +392,7 @@ def store_measurement(conn, data, packet=None, gateway_id=None):
         label = "SIMULATED " if row["simulated"] else ""
         signal = f" rssi={row.get('rx_rssi')} snr={row.get('rx_snr')} hops={row.get('hops')}" if packet else ""
         print(f"[{row['timestamp']}] {label}{node_hex(node_id)} seq {row['seq']}{signal}: {data}")
-        upload_to_supabase(row)
+        upload_row_to_supabase("measurements", row)
 
 def store_node_status(conn, packet, gateway_id):
     decoded = packet.get("decoded", {})
