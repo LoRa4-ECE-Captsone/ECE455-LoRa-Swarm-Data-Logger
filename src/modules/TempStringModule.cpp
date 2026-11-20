@@ -6,7 +6,6 @@
 #include "NodeDB.h"
 #include "RTC.h"
 #include "SwarmReport.h"
-#include "Throttle.h"
 #include <math.h>
 #include <string.h>
 
@@ -15,10 +14,8 @@ TempStringModule *tempStringModule;
 // 14 values at worst "-55.00," plus the header, position and sequence fields must fit one 233-byte payload.
 static_assert(TEMP_STRING_COUNT <= 16, "More probes than fit in one packet; split the string across two packets");
 
-static constexpr int32_t FIRST_CYCLE_DELAY_MS = 20 * 1000;
 static constexpr int32_t CONVERSION_MS = 800; // 12-bit conversion takes 750 ms
 static constexpr int32_t STEP_MS = 20;
-static constexpr uint32_t BUS_WARN_INTERVAL_MS = 10 * 60 * 1000;
 static constexpr uint8_t READ_RETRIES = 1;
 
 TempStringModule::TempStringModule()
@@ -33,14 +30,17 @@ static void formatRom(const uint8_t *rom, char *out)
         snprintf(out + 3 * i, 4, i < 7 ? "%02X:" : "%02X", rom[i]);
 }
 
-void TempStringModule::discover()
+uint8_t TempStringModule::discover()
 {
     sensors.begin();
     sensors.setWaitForConversion(false);
     const uint8_t total = sensors.getDeviceCount();
+    // The per-probe list is only repeated when the number of devices on the bus changes.
+    const bool verbose = total != lastTotal;
+    lastTotal = total;
     if (total == 0) {
         LOG_WARN("TempString: no 1-Wire devices answer on pin %u (check wiring and the 4.7k pull-up to 3.3 V)", TEMP_STRING_PIN);
-        return;
+        return 0;
     }
     sensors.setResolution(12);
 
@@ -57,7 +57,7 @@ void TempStringModule::discover()
                 break;
             }
         }
-        if (!known) {
+        if (!known && verbose) {
             formatRom(rom, text);
             LOG_WARN("TempString: unlisted 1-Wire device %s on the bus (not in temp_string_ids.h)", text);
         }
@@ -67,13 +67,21 @@ void TempStringModule::discover()
     for (uint8_t i = 0; i < TEMP_STRING_COUNT; i++) {
         if (matched[i]) {
             found++;
-        } else {
+        } else if (verbose) {
             formatRom(TEMP_STRING_ROMS[i], text);
             LOG_WARN("TempString: probe %u (%s) not found", i + 1, text);
         }
     }
     LOG_INFO("TempString: %u/%u listed probes found on pin %u (%u devices on bus%s)", found, TEMP_STRING_COUNT, TEMP_STRING_PIN,
              total, sensors.isParasitePowerMode() ? ", parasite power" : "");
+    return total;
+}
+
+void TempStringModule::sampleNow()
+{
+    step = Step::Convert;
+    enabled = true;
+    setIntervalFromNow(0);
 }
 
 float TempStringModule::readProbe(const uint8_t *rom)
@@ -125,12 +133,13 @@ int32_t TempStringModule::runOnce()
 {
     switch (step) {
     case Step::Boot:
-        LOG_INFO("TempString: %u DS18B20 probes on 1-Wire pin %u, every %us%s", TEMP_STRING_COUNT, TEMP_STRING_PIN,
-                 SONDE_INTERVAL_SECS, SONDE_SIMULATE ? " (SIMULATED)" : "");
-        if (!SONDE_SIMULATE)
-            discover();
-        step = Step::Convert;
-        return FIRST_CYCLE_DELAY_MS;
+        LOG_INFO("TempString: %u DS18B20 probes on 1-Wire pin %u, read in each sensor power window%s", TEMP_STRING_COUNT,
+                 TEMP_STRING_PIN, SONDE_SIMULATE ? " (SIMULATED)" : "");
+        step = Step::Idle;
+        return disable();
+
+    case Step::Idle:
+        return disable();
 
     case Step::Convert:
         index = 0;
@@ -142,13 +151,9 @@ int32_t TempStringModule::runOnce()
             step = Step::Report;
             return STEP_MS;
         }
-        if (!bus.reset()) {
-            if (!busWarned || !Throttle::isWithinTimespanMs(lastBusWarnMs, BUS_WARN_INTERVAL_MS)) {
-                LOG_WARN("TempString: no presence pulse on pin %u; skipping this cycle", TEMP_STRING_PIN);
-                busWarned = true;
-                lastBusWarnMs = millis();
-            }
-            return swarm::msUntilNextSlot();
+        if (discover() == 0) {
+            step = Step::Idle;
+            return disable();
         }
         // Non-blocking: starts every probe at once, then the conversion time is spent off this thread.
         sensors.requestTemperatures();
@@ -169,8 +174,8 @@ int32_t TempStringModule::runOnce()
             sendReport();
         else
             LOG_WARN("TempString: no probe returned a valid reading this cycle");
-        step = Step::Convert;
-        return swarm::msUntilNextSlot();
+        step = Step::Idle;
+        return disable();
     }
     return STEP_MS;
 }

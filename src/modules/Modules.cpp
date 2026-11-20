@@ -109,6 +109,9 @@
 #ifdef HAS_TEMP_STRING
 #include "modules/TempStringModule.h"
 #endif
+#if defined(HAS_SONDE) || defined(HAS_TEMP_STRING)
+#include "modules/SensorPower.h"
+#endif
 
 #if defined(HAS_HARDWARE_WATCHDOG)
 #include "watchdog/watchdogThread.h"
@@ -146,6 +149,9 @@ void setupModules()
 #endif
 #ifdef HAS_TEMP_STRING
     tempStringModule = new TempStringModule();
+#endif
+#if defined(HAS_SONDE) || defined(HAS_TEMP_STRING)
+    sensorPower = new SensorPower();
 #endif
 #if !MESHTASTIC_EXCLUDE_WAYPOINT
     waypointModule = new WaypointModule();

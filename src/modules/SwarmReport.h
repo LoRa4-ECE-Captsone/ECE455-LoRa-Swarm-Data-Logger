@@ -10,9 +10,20 @@
 #include <stdio.h>
 #include <string.h>
 
-#ifndef SONDE_INTERVAL_SECS
-#define SONDE_INTERVAL_SECS (30 * 60)
+// Sensor power schedule (SensorPower.cpp): every SENSOR_CYCLE_SECS the sensor supply is switched on for SENSOR_ON_SECS,
+// and the sensors are read SENSOR_WARMUP_SECS after power-on.
+#ifndef SENSOR_CYCLE_SECS
+#define SENSOR_CYCLE_SECS (30 * 60)
 #endif
+#ifndef SENSOR_ON_SECS
+#define SENSOR_ON_SECS (3 * 60)
+#endif
+#ifndef SENSOR_WARMUP_SECS
+#define SENSOR_WARMUP_SECS (2 * 60)
+#endif
+static_assert(SENSOR_ON_SECS < SENSOR_CYCLE_SECS, "The sensor power window must be shorter than the cycle");
+// Worst case the sonde + weather station reads (all retries timing out) take about 40 s after warm-up.
+static_assert(SENSOR_ON_SECS - SENSOR_WARMUP_SECS >= 45, "Leave at least 45 s of power after warm-up for the readings");
 #ifndef SONDE_SIMULATE
 #define SONDE_SIMULATE 0
 #endif
@@ -145,7 +156,7 @@ inline void addPosition(JsonWriter &j)
 // the swarm samples together, offset per node by a fixed hash of its ID so nodes don't all transmit at once.
 inline int32_t msUntilNextSlot()
 {
-    const uint64_t intervalMs = (uint64_t)SONDE_INTERVAL_SECS * 1000;
+    const uint64_t intervalMs = (uint64_t)SENSOR_CYCLE_SECS * 1000;
     uint32_t now = getValidTime(RTCQualityDevice);
     if (now == 0)
         return (int32_t)intervalMs;

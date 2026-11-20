@@ -18,17 +18,15 @@ SondeModule *sondeModule;
 #ifndef SONDE_BRUSH
 #define SONDE_BRUSH 1
 #endif
-#ifndef SONDE_POWER_PIN
-#define SONDE_POWER_PIN -1
-#endif
 // 0 = no weather station on the bus.
 #ifndef WX_MODBUS_ADDR
 #define WX_MODBUS_ADDR 0
 #endif
 
-static constexpr int32_t FIRST_CYCLE_DELAY_MS = 45 * 1000;
-static constexpr int32_t WARMUP_MS = 2000;         // Y4000 answers ~1 s after power-up
+static constexpr int32_t BRUSH_DELAY_MS = 2000;    // Y4000 answers ~1 s after power-up
 static constexpr int32_t STABILIZE_MS = 50 * 1000; // EnviroDIY ModularSensors Y4000 stabilisation time
+static_assert((int32_t)SENSOR_WARMUP_SECS * 1000 >= BRUSH_DELAY_MS + STABILIZE_MS,
+              "SENSOR_WARMUP_SECS is shorter than the Y4000 needs to stabilise after its brush");
 static constexpr uint32_t REPLY_TIMEOUT_MS = 1000;
 static constexpr int32_t REPLY_POLL_MS = 50;
 static constexpr int32_t RETRY_GAP_MS = 500;
@@ -38,8 +36,6 @@ static constexpr uint32_t ERROR_REPORT_INTERVAL_MS = 5 * 60 * 1000;
 // DFRobot asks for > 200 ms between SEN0657 polls; at 200 ms it mostly answered with a fixed "not ready" pattern.
 static constexpr int32_t WX_GAP_MS = 1000;
 static constexpr uint8_t WX_MAX_ATTEMPTS = 2;
-// Intervals shorter than a power-up + stabilisation cycle keep the sonde powered and skip the brush between reads.
-static constexpr bool CONTINUOUS = SONDE_INTERVAL_SECS * 1000 < WARMUP_MS + STABILIZE_MS;
 
 static constexpr uint8_t FN_READ_HOLDING = 0x03;
 static constexpr uint8_t FN_WRITE_MULTIPLE = 0x10;
@@ -64,6 +60,17 @@ static constexpr uint16_t WX_REGS[] = {
     0x0201, // rain, mm x10, accumulated since power-up or zeroing
 };
 static constexpr uint8_t WX_READ_COUNT = sizeof(WX_REGS) / sizeof(WX_REGS[0]);
+// SEN0657 settings registers (DFRobot wiki): Modbus address 1-254 (factory 1) and baud code (factory 1 = 4800).
+static constexpr uint16_t REG_WX_ADDRESS = 0x07D0;
+static constexpr uint32_t WX_BAUD_CODES[] = {2400, 4800, 9600, 19200, 38400, 57600, 115200, 1200};
+static constexpr uint16_t NO_REPLY = 0xFFFF;
+
+// Words this SEN0657 sends instead of data when a reading isn't ready (not in DFRobot's docs). Every register is
+// checked because 0x32D0 as a light low word would otherwise pass as 13008 lux.
+static bool wxNotReady(uint16_t raw)
+{
+    return raw == 0x32D0 || raw == 0xF000;
+}
 
 enum ValueIndex : uint8_t { DO_MGL, TURBIDITY_NTU, COND_MS_CM, PH, TEMP_C, ORP_MV, CHL_UG_L, BGA };
 
@@ -80,17 +87,71 @@ static uint16_t modbusCrc(const uint8_t *data, size_t len)
 
 SondeModule::SondeModule() : SinglePortModule("sonde", meshtastic_PortNum_PRIVATE_APP), concurrency::OSThread("Sonde") {}
 
-void SondeModule::powerSonde(bool on)
+void SondeModule::wake(uint32_t ms)
 {
-#if SONDE_POWER_PIN >= 0
-    digitalWrite(SONDE_POWER_PIN, on ? HIGH : LOW);
-#endif
-    // The UART is only open while the sonde is powered so the UARTE doesn't hold HFCLK on between cycles.
+    enabled = true;
+    setIntervalFromNow(ms);
+}
+
+void SondeModule::openBus(bool on)
+{
+    // The UART is only open while the sensors are powered so the UARTE doesn't hold HFCLK on between cycles.
     if (on)
         RS485_SERIAL.begin(RS485_BAUD);
     else
         RS485_SERIAL.end();
     powered = on;
+}
+
+void SondeModule::sensorsPowered(bool on)
+{
+    if (on == powered)
+        return;
+    if (!on && step != Step::Idle && step != Step::Boot && step != Step::Brush) {
+        LOG_WARN("Sonde: sensor power went off mid-read; sending what was read");
+        sendReport();
+        step = Step::Idle;
+        disable();
+    }
+    openBus(on);
+    if (on && SONDE_BRUSH && !SONDE_SIMULATE) {
+        step = Step::Brush;
+        wake(BRUSH_DELAY_MS);
+    }
+}
+
+void SondeModule::sampleNow()
+{
+    valuesOk = false;
+    statusOk = false;
+    weatherOk = false;
+    weatherAnswered = false;
+    weatherPart = 0;
+    weatherValid = 0;
+    luxHighOk = false;
+    weather = {NAN, NAN, NAN, NAN, NAN, NAN, NAN};
+    attempts = 0;
+    if (SONDE_SIMULATE) {
+        simulateValues();
+        step = Step::Report;
+    } else {
+        step = Step::RequestValues;
+    }
+    wake(0);
+}
+
+void SondeModule::logWxConfig()
+{
+    const uint16_t addr = wxConfig[0], code = wxConfig[1];
+    const uint32_t baud = code < sizeof(WX_BAUD_CODES) / sizeof(WX_BAUD_CODES[0]) ? WX_BAUD_CODES[code] : 0;
+    if (addr == NO_REPLY || code == NO_REPLY)
+        LOG_WARN("SEN0657: answers at addr %u / %u baud but not on its settings registers 0x07D0/0x07D1", WX_MODBUS_ADDR,
+                 RS485_BAUD);
+    else if (addr == WX_MODBUS_ADDR && baud == RS485_BAUD)
+        LOG_INFO("SEN0657: settings registers confirm Modbus addr %u at %u baud", addr, baud);
+    else
+        LOG_WARN("SEN0657: answers at addr %u / %u baud, but its settings registers read addr 0x%04x, baud code 0x%04x",
+                 WX_MODBUS_ADDR, RS485_BAUD, addr, code);
 }
 
 void SondeModule::sendFrame(uint8_t *frame, size_t lenWithoutCrc)
@@ -184,6 +245,11 @@ void SondeModule::decodeWeather()
 {
     const uint16_t raw = (uint16_t)((rx[3] << 8) | rx[4]);
     LOG_DEBUG("RS485: weather reg 0x%04x = 0x%04x (%u)", WX_REGS[weatherPart], raw, raw);
+    if (wxNotReady(raw)) {
+        if (weatherPart == 5)
+            luxHighOk = false;
+        return;
+    }
     // Physically impossible values are dropped (left NaN) so a stray "not ready" word never reaches the mesh.
     auto keep = [this](float &field, float value, float low, float high) {
         if (value >= low && value <= high) {
@@ -341,52 +407,22 @@ void SondeModule::sendReport()
     }
 }
 
-int32_t SondeModule::msUntilNextCycle()
-{
-    return swarm::msUntilNextSlot();
-}
-
 int32_t SondeModule::runOnce()
 {
     switch (step) {
     case Step::Boot:
-#if SONDE_POWER_PIN >= 0
-        pinMode(SONDE_POWER_PIN, OUTPUT);
-        digitalWrite(SONDE_POWER_PIN, LOW);
-#endif
-        LOG_INFO("RS485: %u baud 8N1; Y4000 sonde at Modbus addr %u, SEN0657 weather station at addr %u (0 = none), every %us%s",
-                 RS485_BAUD, SONDE_MODBUS_ADDR, WX_MODBUS_ADDR, SONDE_INTERVAL_SECS, SONDE_SIMULATE ? " (SIMULATED)" : "");
+        LOG_INFO("RS485: %u baud 8N1; Y4000 sonde at Modbus addr %u, SEN0657 weather station at addr %u (0 = none)%s",
+                 RS485_BAUD, SONDE_MODBUS_ADDR, WX_MODBUS_ADDR, SONDE_SIMULATE ? " (SIMULATED)" : "");
         step = Step::Idle;
-        return FIRST_CYCLE_DELAY_MS;
+        return disable();
 
     case Step::Idle:
-        valuesOk = false;
-        statusOk = false;
-        weatherOk = false;
-        weatherPart = 0;
-        weatherValid = 0;
-        luxHighOk = false;
-        weather = {NAN, NAN, NAN, NAN, NAN, NAN, NAN};
-        attempts = 0;
-        if (SONDE_SIMULATE) {
-            simulateValues();
-            step = Step::Report;
-            return STEP_MS;
-        }
-        if (powered) {
-            step = Step::RequestValues;
-            return STEP_MS;
-        }
-        LOG_INFO("Sonde: power on%s", CONTINUOUS ? " (continuous mode, stays powered)" : "");
-        powerSonde(true);
-        step = Step::Brush;
-        return WARMUP_MS;
+        return disable();
 
     case Step::Brush:
-        if (SONDE_BRUSH)
-            requestBrush();
-        step = Step::RequestValues;
-        return STABILIZE_MS;
+        requestBrush();
+        step = Step::Idle;
+        return disable();
 
     case Step::RequestValues:
         requestRegisters(SONDE_MODBUS_ADDR, REG_VALUES, VALUE_COUNT * 2);
@@ -443,24 +479,54 @@ int32_t SondeModule::runOnce()
             step = Step::RequestWeather;
             return WX_GAP_MS;
         }
-        if (r == Reply::Ok)
+        if (r == Reply::Ok) {
+            weatherAnswered = true;
             decodeWeather();
+        }
         attempts = 0;
         // A part that never answered leaves its fields NaN, which the JSON writer omits.
-        step = ++weatherPart < WX_READ_COUNT ? Step::RequestWeather : Step::Report;
-        if (step == Step::Report)
-            LOG_INFO("Weather: %u/7 values valid from Modbus addr %u", weatherValid, WX_MODBUS_ADDR);
-        return step == Step::Report ? STEP_MS : WX_GAP_MS;
+        if (++weatherPart < WX_READ_COUNT) {
+            step = Step::RequestWeather;
+            return WX_GAP_MS;
+        }
+        LOG_INFO("Weather: %u/7 values valid from Modbus addr %u", weatherValid, WX_MODBUS_ADDR);
+        if (!weatherAnswered) {
+            LOG_WARN("SEN0657: no reply at Modbus addr %u, %u baud. Factory default is addr 1 at 4800 baud: set it to addr %u, "
+                     "baud code 2 (9600) via registers 0x07D0/0x07D1",
+                     WX_MODBUS_ADDR, RS485_BAUD, WX_MODBUS_ADDR);
+        } else if (!wxConfigChecked) {
+            wxConfigPart = 0;
+            step = Step::RequestWxConfig;
+            return WX_GAP_MS;
+        }
+        step = Step::Report;
+        return STEP_MS;
+    }
+
+    case Step::RequestWxConfig:
+        requestRegisters(WX_MODBUS_ADDR, REG_WX_ADDRESS + wxConfigPart, 1);
+        step = Step::AwaitWxConfig;
+        return REPLY_POLL_MS;
+
+    case Step::AwaitWxConfig: {
+        Reply r = pollReply(WX_MODBUS_ADDR, 5 + 2);
+        if (r == Reply::Pending)
+            return REPLY_POLL_MS;
+        wxConfig[wxConfigPart] = r == Reply::Ok ? (uint16_t)((rx[3] << 8) | rx[4]) : NO_REPLY;
+        if (++wxConfigPart < 2) {
+            step = Step::RequestWxConfig;
+            return WX_GAP_MS;
+        }
+        logWxConfig();
+        wxConfigChecked = true;
+        step = Step::Report;
+        return STEP_MS;
     }
 
     case Step::Report:
-        if (!SONDE_SIMULATE && !CONTINUOUS) {
-            powerSonde(false);
-            LOG_INFO("Sonde: power off");
-        }
         sendReport();
         step = Step::Idle;
-        return msUntilNextCycle();
+        return disable();
     }
     return STEP_MS;
 }

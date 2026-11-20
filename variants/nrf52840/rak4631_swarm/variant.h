@@ -221,7 +221,7 @@ SO GPIO 39/TXEN MAY NOT BE DEFINED FOR SUCCESSFUL OPERATION OF THE SX1262 - TG
 
 // No UART GPS: GPS_RX_PIN/GPS_TX_PIN are left undefined so Meshtastic's GPS driver never opens a UART.
 // The RAK12500 is read over I2C by GnssI2CModule, which works in any RAK19001 slot.
-// In Slot E its RESET_N lands on IO3 and 1PPS on IO4; neither is driven by firmware.
+// Older notes put its RESET_N on IO3 in Slot E, but with IO3 driven low (SENSOR_POWER_PIN) it kept answering on I2C.
 #define HAS_GNSS_I2C 1
 #define GNSS_I2C_ADDR 0x42
 
@@ -234,8 +234,10 @@ SO GPIO 39/TXEN MAY NOT BE DEFINED FOR SUCCESSFUL OPERATION OF THE SX1262 - TG
 #define SONDE_MODBUS_ADDR 1
 // DFRobot SEN0657 7-in-1 ultrasonic weather station (factory default is addr 1 at 4800 baud; must be changed).
 #define WX_MODBUS_ADDR 2
-// Y4000 12 V load switch enable, active high. P0.28 = header pin "IO7" on the RAK19001. Set -1 if always powered.
-#define SONDE_POWER_PIN 28
+// Sensor supply MOSFET switch (sonde, weather station, temp string), driven by SensorPower: IO3 = P0.21, on when high.
+// The schedule (on time, cycle, warm-up) is set in platformio.ini. Set -1 if the sensors are always powered.
+#define SENSOR_POWER_PIN 21
+#define SENSOR_POWER_ON_LEVEL HIGH
 
 // DS18B20 temperature string on 1-Wire: AIN1 = P0.31 (RAK19001 header "AIN1"), 4.7k pull-up to 3.3 V.
 // Not IO1: wiring the string there knocked out both the RAK5802 RS485 and the GNSS. ROM codes are in temp_string_ids.h.
